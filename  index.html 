@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ml">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -19,71 +19,29 @@
 (() => {
   const canvas = document.getElementById("c");
   const ctx = canvas.getContext("2d");
+
   const W = canvas.width, H = canvas.height;
 
   const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
   const lerp = (a,b,t)=>a+(b-a)*t;
   const rand = (a,b)=>a+Math.random()*(b-a);
 
-  // ---------- Config ----------
-  const MAX_SPEED = 260;          // km/h
-  const MIN_SPEED = 60;           // km/h start
-  const KM_TO_SPEED_RATE = 14;    // speed increases per km
+  // ---------- Game Config ----------
+  const MAX_SPEED = 260;          // km/h (your requirement)
+  const MIN_SPEED = 60;           // starting speed
+  const KM_TO_SPEED_RATE = 14;    // how fast speed increases per km
   const LANES = 3;
 
-  // ---------- Sprite sheet ----------
-  // Save your image as: cars.jpg (same folder as index.html)
-  const SPRITE_URL = "cars.jpg";
-  const spriteImg = new Image();
-  spriteImg.src = SPRITE_URL;
-  let spriteReady = false;
-  spriteImg.onload = () => { spriteReady = true; };
-
-  // Layout (your image: 2 rows, top has 8 cars, bottom has 7 cars)
-  // We must ignore the top title and bottom text areas.
-  const SPR = {
-    colsTop: 8,
-    colsBottom: 7,
-    rows: 2,
-    padTopText: 70,
-    padBottomText: 110,
-    padSide: 0
-  };
-
-  function getCarRect(row, col){
-    const usableX = SPR.padSide;
-    const usableY = SPR.padTopText;
-    const usableW = spriteImg.width - SPR.padSide*2;
-    const usableH = spriteImg.height - SPR.padTopText - SPR.padBottomText;
-
-    const rowH = usableH / SPR.rows;
-
-    if(row === 0){
-      const cellW = usableW / SPR.colsTop;
-      return { sx: usableX + col*cellW, sy: usableY + 0*rowH, sw: cellW, sh: rowH };
-    } else {
-      const cellW = usableW / SPR.colsBottom;
-      return { sx: usableX + col*cellW, sy: usableY + 1*rowH, sw: cellW, sh: rowH };
-    }
-  }
-
-  // Player: orange car = top row last (index 7)
-  const PLAYER_SPR = { row: 0, col: 7 };
-
-  // NPC pool: all other cars
-  const NPC_SPRS = [
-    ...Array.from({length: 7}, (_,i)=>({row:0,col:i})),  // top row 0..6
-    ...Array.from({length: 7}, (_,i)=>({row:1,col:i}))   // bottom row 0..6
-  ];
-
-  // ---------- Track (curves change quickly) ----------
+  // Road/track “changes quickly”
   const track = {
+    // centerX will move left/right (curves)
     centerX: W*0.5,
     centerVel: 0,
     targetX: W*0.5,
     changeTimer: 0,
     changeEveryMin: 0.9,
     changeEveryMax: 1.8,
+
     topWidth: 260,
     bottomWidth: 330
   };
@@ -109,23 +67,28 @@
 
     km: 0,
     speed: MIN_SPEED,
-    worldPxPerSec: 260,
 
+    // Used to convert km/h to world pixels per second (visual feel)
+    worldPxPerSec: 260, // will be computed from speed each frame
+
+    // spawn logic
     spawnT: 0,
     spawnEvery: 0.75,
 
+    // scrolling visuals
     scroll: 0
   };
 
   const player = {
     x: W*0.5,
     y: H*0.78,
-    w: 44,
-    h: 78,
-    maxSteerPx: 320
+    w: 40,
+    h: 72,
+    steer: 0,
+    maxSteerPx: 320,
   };
 
-  const traffic = [];
+  const traffic = []; // NPC cars + trucks
   const particles = [];
 
   // ---------- Input (steering only) ----------
@@ -135,7 +98,7 @@
     keys.add(k);
 
     if (k === "escape") state.screen = "menu";
-    if (k === "r" && state.screen==="gameover") startGame();
+    if (k === "r" && (state.screen==="gameover")) startGame();
   });
   window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
 
@@ -145,12 +108,14 @@
   window.addEventListener("pointerup", ()=>{ pointerX = null; });
 
   // ---------- UI Buttons (canvas) ----------
-  function btn(x,y,w,h,label){ return {x,y,w,h,label}; }
+  function btn(x,y,w,h,label){
+    return {x,y,w,h,label};
+  }
   const UI = {
-    start:   btn(W*0.5-120, H*0.52,     240, 54, "START"),
-    high:    btn(W*0.5-120, H*0.52+70,  240, 54, "HIGH SCORE"),
-    back:    btn(16, 16, 110, 40, "BACK"),
-    restart: btn(W*0.5-120, H*0.62,     240, 54, "RESTART")
+    start: btn(W*0.5-120, H*0.52, 240, 54, "START"),
+    high:  btn(W*0.5-120, H*0.52+70, 240, 54, "HIGH SCORE"),
+    back:  btn(16, 16, 110, 40, "BACK"),
+    restart: btn(W*0.5-120, H*0.62, 240, 54, "RESTART")
   };
 
   canvas.addEventListener("click", (e) => {
@@ -182,9 +147,11 @@
 
   function drawButton(b){
     ctx.save();
+    // shadow
     ctx.fillStyle = "rgba(0,0,0,0.35)";
     roundRect(b.x, b.y+3, b.w, b.h, 12); ctx.fill();
 
+    // body
     ctx.fillStyle = "#111827";
     ctx.strokeStyle = "#334155";
     ctx.lineWidth = 2;
@@ -198,57 +165,93 @@
     ctx.restore();
   }
 
-  // ---------- Sprite draw ----------
-  function drawSpriteCar(x, y, w, h, spr){
-    if(!spriteReady){
-      ctx.fillStyle = "#f97316";
-      roundRect(x-w/2, y-h/2, w, h, 10); ctx.fill();
-      return;
-    }
+  // ---------- Cars ----------
+  // Orange BMW-like (simple shape), NPC cars + trucks
+  function drawPlayerBMW(x,y,w,h){
+    ctx.save();
+    ctx.translate(x,y);
 
-    const r = getCarRect(spr.row, spr.col);
+    // glow (fast feeling)
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = "#fb923c";
+    roundRect(-w*0.62, -h*0.55, w*1.24, h*1.12, 16);
+    ctx.fill();
+    ctx.globalAlpha = 1;
 
-    // Crop inside each cell to remove margins/background
-    const insetX = r.sw * 0.12;
-    const insetY = r.sh * 0.18;
+    // body
+    ctx.fillStyle = "#f97316"; // orange
+    roundRect(-w/2, -h/2, w, h, 10); ctx.fill();
 
-    const sx = r.sx + insetX;
-    const sy = r.sy + insetY;
-    const sw = r.sw - insetX*2;
-    const sh = r.sh - insetY*2;
+    // hood/roof
+    ctx.fillStyle = "rgba(255,255,255,0.18)";
+    roundRect(-w*0.28, -h*0.34, w*0.56, h*0.22, 8); ctx.fill();
 
-    ctx.drawImage(spriteImg, sx, sy, sw, sh, x - w/2, y - h/2, w, h);
-  }
+    // BMW-ish stripes / grill hint
+    ctx.fillStyle = "rgba(17,24,39,0.55)";
+    roundRect(-w*0.18, -h*0.05, w*0.36, h*0.15, 6); ctx.fill();
 
-  function drawPlayerCar(){
-    drawSpriteCar(player.x, player.y, player.w, player.h, PLAYER_SPR);
+    // headlights
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.fillRect(-w*0.36, -h*0.46, w*0.22, 6);
+    ctx.fillRect( w*0.14, -h*0.46, w*0.22, 6);
 
-    // extra speed glow when near max
-    const t = state.speed / MAX_SPEED;
-    if(t > 0.9){
-      ctx.save();
-      ctx.globalAlpha = (t - 0.9) / 0.1 * 0.25;
-      ctx.fillStyle = "#fb923c";
-      roundRect(player.x-player.w*0.75, player.y-player.h*0.65, player.w*1.5, player.h*1.35, 18);
-      ctx.fill();
-      ctx.restore();
-    }
+    // wheels
+    ctx.fillStyle = "#0b0f14";
+    ctx.fillRect(-w/2-5, -h/2+12, 7, 16);
+    ctx.fillRect(-w/2-5,  h/2-28, 7, 16);
+    ctx.fillRect( w/2-2, -h/2+12, 7, 16);
+    ctx.fillRect( w/2-2,  h/2-28, 7, 16);
+
+    ctx.restore();
   }
 
   function drawNpcCar(o){
-    drawSpriteCar(o.x, o.y, o.w, o.h, o.spr);
+    ctx.save();
+    ctx.translate(o.x,o.y);
+
+    if(o.type==="truck"){
+      // truck body
+      ctx.fillStyle = o.color;
+      roundRect(-o.w/2, -o.h/2, o.w, o.h, 8); ctx.fill();
+
+      ctx.fillStyle = "rgba(255,255,255,0.15)";
+      roundRect(-o.w*0.30, -o.h*0.36, o.w*0.60, o.h*0.20, 6); ctx.fill();
+
+      // container
+      ctx.fillStyle = "rgba(17,24,39,0.55)";
+      roundRect(-o.w*0.40, -o.h*0.05, o.w*0.80, o.h*0.45, 10); ctx.fill();
+    } else {
+      // car body
+      ctx.fillStyle = o.color;
+      roundRect(-o.w/2, -o.h/2, o.w, o.h, 10); ctx.fill();
+      ctx.fillStyle = "rgba(0,0,0,0.22)";
+      roundRect(-o.w*0.30, -o.h*0.34, o.w*0.60, o.h*0.24, 8); ctx.fill();
+
+      // stripe
+      ctx.fillStyle = "rgba(255,255,255,0.75)";
+      roundRect(-o.w*0.07, -o.h*0.45, o.w*0.14, o.h*0.9, 6); ctx.fill();
+    }
+
+    // wheels
+    ctx.fillStyle = "#0b0f14";
+    ctx.fillRect(-o.w/2-5, -o.h/2+12, 7, 16);
+    ctx.fillRect(-o.w/2-5,  o.h/2-28, 7, 16);
+    ctx.fillRect( o.w/2-2, -o.h/2+12, 7, 16);
+    ctx.fillRect( o.w/2-2,  o.h/2-28, 7, 16);
+
+    ctx.restore();
   }
 
-  // ---------- Road + grass ----------
+  // ---------- Road + Grass (look similar to screenshot) ----------
   function drawScene(dt){
-    // grass
+    // grass sides
     ctx.fillStyle = "#2f7d2f";
     ctx.fillRect(0,0,W,H);
 
-    // grass noise
+    // subtle grass noise
     ctx.save();
     ctx.globalAlpha = 0.12;
-    for(let i=0;i<90;i++){
+    for(let i=0;i<120;i++){
       ctx.fillStyle = (i%2===0) ? "#1f6a1f" : "#3c9a3c";
       ctx.fillRect(Math.random()*W, Math.random()*H, rand(8,18), rand(8,20));
     }
@@ -264,7 +267,7 @@
     ctx.closePath();
     ctx.fill();
 
-    // road edges
+    // road edge borders
     ctx.strokeStyle = "rgba(255,255,255,0.55)";
     ctx.lineWidth = 3;
     ctx.beginPath();
@@ -272,7 +275,7 @@
     ctx.moveTo(R0,0); ctx.lineTo(R1,H);
     ctx.stroke();
 
-    // center yellow line
+    // center yellow line (like screenshot)
     ctx.strokeStyle = "#fbbf24";
     ctx.lineWidth = 4;
     ctx.beginPath();
@@ -282,7 +285,7 @@
     }
     ctx.stroke();
 
-    // lane dashed lines
+    // lane dashed white lines (2 lines for 3 lanes)
     const dashSpeed = state.worldPxPerSec * 0.9;
     state.scroll += dt * dashSpeed;
     const dashOffset = -state.scroll;
@@ -307,10 +310,11 @@
 
   // ---------- HUD ----------
   function drawHUD(){
+    // Left: KM, Right: SPEED
     ctx.save();
     ctx.textBaseline = "top";
 
-    // Left: KM
+    // left panel
     ctx.fillStyle = "rgba(0,0,0,0.45)";
     roundRect(12, 12, 150, 56, 12); ctx.fill();
     ctx.fillStyle = "#e5e7eb";
@@ -319,13 +323,342 @@
     ctx.font = "900 22px system-ui";
     ctx.fillText(state.km.toFixed(2), 24, 36);
 
-    // Right: SPEED
+    // right panel
     ctx.fillStyle = "rgba(0,0,0,0.45)";
     roundRect(W-12-170, 12, 170, 56, 12); ctx.fill();
     ctx.fillStyle = "#e5e7eb";
     ctx.font = "800 14px system-ui";
     ctx.fillText("SPEED (km/h)", W-12-170+14, 20);
 
+    // speed number (color changes near max)
     const nearMax = state.speed / MAX_SPEED;
     ctx.font = "900 22px system-ui";
-    ctx.fillStyle
+    ctx.fillStyle = nearMax > 0.92 ? "#f97316" : "#e5e7eb";
+    ctx.fillText(String(Math.round(state.speed)), W-12-170+14, 36);
+
+    ctx.restore();
+  }
+
+  // ---------- Spawning traffic ----------
+  function spawnTraffic(){
+    const yRef = H * 0.35;
+
+    // choose lane & type
+    const lane = Math.floor(rand(0, LANES));
+    const x = laneCenter(lane, yRef);
+
+    const isTruck = Math.random() < clamp(0.18 + state.km*0.02, 0.18, 0.35);
+    const colors = ["#60a5fa","#ef4444","#22c55e","#a855f7","#f59e0b","#94a3b8"];
+
+    const o = {
+      type: isTruck ? "truck" : "car",
+      x,
+      y: -120,
+      w: isTruck ? 52 : 40,
+      h: isTruck ? 96 : 74,
+      color: colors[Math.floor(rand(0, colors.length))],
+      vy: state.worldPxPerSec * rand(0.85, 1.15)
+    };
+
+    // avoid instant overlap at spawn
+    for(const t of traffic){
+      if(Math.abs(t.x - o.x) < 50 && Math.abs(t.y - o.y) < 120) return;
+    }
+    traffic.push(o);
+  }
+
+  function overlap(a,b){
+    return (Math.abs(a.x-b.x)*2 < (a.w+b.w)) && (Math.abs(a.y-b.y)*2 < (a.h+b.h));
+  }
+
+  function explode(x,y){
+    for(let i=0;i<26;i++){
+      particles.push({
+        x,y,
+        vx: rand(-170,170),
+        vy: rand(-260,40),
+        life: rand(0.45,0.85),
+        r: rand(2,4)
+      });
+    }
+  }
+
+  // ---------- Track changes quickly ----------
+  function updateTrack(dt){
+    track.changeTimer -= dt;
+    if(track.changeTimer <= 0){
+      track.changeTimer = rand(track.changeEveryMin, track.changeEveryMax);
+
+      // new target center: keep road inside canvas
+      const margin = 56;
+      track.targetX = clamp(rand(W*0.5-90, W*0.5+90), margin, W-margin);
+    }
+
+    // quick-ish curve
+    const toTarget = (track.targetX - track.centerX);
+    track.centerVel += toTarget * dt * 2.8;
+    track.centerVel *= (1 - dt * 2.2);
+    track.centerX += track.centerVel * dt * 60;
+
+    // keep safe
+    track.centerX = clamp(track.centerX, 90, W-90);
+  }
+
+  // ---------- Game Flow ----------
+  function startGame(){
+    traffic.length = 0;
+    particles.length = 0;
+
+    state.km = 0;
+    state.speed = MIN_SPEED;
+    state.spawnT = 0;
+    state.spawnEvery = 0.75;
+    state.scroll = 0;
+
+    player.x = W*0.5;
+
+    track.centerX = W*0.5;
+    track.targetX = W*0.5;
+    track.centerVel = 0;
+    track.changeTimer = 0.1;
+
+    state.screen = "playing";
+  }
+
+  // ---------- Main Loop ----------
+  let last = performance.now();
+  requestAnimationFrame(function loop(now){
+    const dt = Math.min(0.033, (now-last)/1000);
+    last = now;
+
+    tick(dt);
+    draw(dt);
+
+    requestAnimationFrame(loop);
+  });
+
+  function tick(dt){
+    if(state.screen !== "playing") return;
+
+    // speed increases with kilometres (requirement)
+    // km grows by speed: km/h -> km per second = speed/3600
+    state.km += (state.speed / 3600) * dt;
+
+    // increase speed by km
+    const targetSpeed = clamp(MIN_SPEED + state.km * KM_TO_SPEED_RATE, MIN_SPEED, MAX_SPEED);
+    // make it “feel fast” near 260
+    const accel = (state.speed < 220) ? 18 : 28;
+    state.speed += (targetSpeed - state.speed) * clamp(accel * dt, 0, 1);
+
+    // convert speed to world pixels/sec (visual feel)
+    // tuned so 260 looks VERY fast
+    const speedT = state.speed / MAX_SPEED;
+    state.worldPxPerSec = lerp(260, 820, Math.pow(speedT, 1.35));
+
+    // track changes quickly
+    updateTrack(dt);
+
+    // spawn traffic more as speed increases
+    state.spawnEvery = clamp(0.85 - speedT*0.45, 0.34, 0.85);
+    state.spawnT += dt;
+    if(state.spawnT >= state.spawnEvery){
+      state.spawnT = 0;
+      spawnTraffic();
+      if(Math.random() < clamp(0.06 + speedT*0.18, 0.06, 0.25)) spawnTraffic();
+    }
+
+    // steering only
+    let steer = 0;
+    if(keys.has("arrowleft") || keys.has("a")) steer -= 1;
+    if(keys.has("arrowright") || keys.has("d")) steer += 1;
+
+    // mobile pointer steering
+    if(pointerX !== null){
+      const dx = pointerX - player.x;
+      steer = clamp(dx / 70, -1, 1);
+    }
+
+    // apply steering
+    const steerPx = player.maxSteerPx * (0.65 + speedT*0.55); // harder/faster feel at high speed
+    player.x += steer * steerPx * dt;
+
+    // keep inside road
+    const yRef = player.y + player.h*0.25;
+    const L = roadLeftAt(yRef) + player.w*0.55;
+    const R = roadRightAt(yRef) - player.w*0.55;
+    player.x = clamp(player.x, L, R);
+
+    // update traffic
+    for(let i=traffic.length-1;i>=0;i--){
+      const t = traffic[i];
+      t.y += (t.vy + state.worldPxPerSec*0.25) * dt;
+
+      // slight drift due to curves
+      t.x += (track.centerX - W*0.5) * dt * 0.15;
+
+      if(t.y > H + 140) traffic.splice(i,1);
+    }
+
+    // collisions
+    const pBox = {x:player.x,y:player.y,w:player.w,h:player.h};
+    for(const t of traffic){
+      const tBox = {x:t.x,y:t.y,w:t.w,h:t.h};
+      if(overlap(pBox,tBox)){
+        state.screen = "gameover";
+        explode(player.x, player.y);
+
+        // best score: KM
+        if(state.km > state.bestKm){
+          state.bestKm = state.km;
+          localStorage.setItem("bestKm", String(state.bestKm));
+        }
+        break;
+      }
+    }
+
+    // particles
+    for(let i=particles.length-1;i>=0;i--){
+      const p=particles[i];
+      p.life -= dt;
+      p.x += p.vx*dt;
+      p.y += p.vy*dt;
+      p.vy += 520*dt;
+      if(p.life<=0) particles.splice(i,1);
+    }
+  }
+
+  function draw(dt){
+    ctx.clearRect(0,0,W,H);
+
+    if(state.screen === "menu"){
+      drawMenu();
+      return;
+    }
+    if(state.screen === "highscores"){
+      drawHighScores();
+      return;
+    }
+
+    // playing/gameover background
+    drawScene(dt);
+
+    // traffic
+    for(const t of traffic) drawNpcCar(t);
+
+    // player
+    drawPlayerBMW(player.x, player.y, player.w, player.h);
+
+    // particles
+    ctx.save();
+    for(const p of particles){
+      ctx.globalAlpha = clamp(p.life,0,1);
+      ctx.fillStyle = "#f97316";
+      ctx.beginPath();
+      ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // HUD
+    drawHUD();
+
+    if(state.screen === "gameover"){
+      drawGameOver();
+    }
+  }
+
+  function drawMenu(){
+    // background similar style
+    ctx.fillStyle = "#0b0f14";
+    ctx.fillRect(0,0,W,H);
+
+    // preview road
+    track.centerX = W*0.5;
+    drawScene(0);
+
+    // overlay
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    roundRect(28, 90, W-56, 220, 18); ctx.fill();
+
+    ctx.fillStyle = "#e5e7eb";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = "900 28px system-ui";
+    ctx.fillText("CAR RACING", W/2, 140);
+
+    ctx.font = "600 14px system-ui";
+    ctx.fillStyle = "rgba(229,231,235,0.9)";
+    ctx.fillText("Steering only • Speed increases with kilometres • Max 260", W/2, 175);
+
+    // buttons
+    drawButton(UI.start);
+    drawButton(UI.high);
+
+    // best
+    ctx.fillStyle = "rgba(229,231,235,0.9)";
+    ctx.font = "800 14px system-ui";
+    ctx.fillText("Best KM: " + state.bestKm.toFixed(2), W/2, H*0.52+70+70);
+
+    // control hint
+    ctx.font = "600 12px system-ui";
+    ctx.fillStyle = "rgba(229,231,235,0.75)";
+    ctx.fillText("Controls: ← → or A D  |  Mobile: swipe", W/2, H-40);
+  }
+
+  function drawHighScores(){
+    ctx.fillStyle="#0b0f14";
+    ctx.fillRect(0,0,W,H);
+
+    ctx.fillStyle="rgba(0,0,0,0.55)";
+    roundRect(28, 90, W-56, 260, 18); ctx.fill();
+
+    ctx.fillStyle="#e5e7eb";
+    ctx.textAlign="center";
+    ctx.textBaseline="middle";
+    ctx.font="900 26px system-ui";
+    ctx.fillText("HIGH SCORE", W/2, 130);
+
+    ctx.font="800 18px system-ui";
+    ctx.fillStyle="rgba(229,231,235,0.95)";
+    ctx.fillText("Best Distance (KM)", W/2, 190);
+
+    ctx.font="900 34px system-ui";
+    ctx.fillStyle="#f97316";
+    ctx.fillText(state.bestKm.toFixed(2), W/2, 240);
+
+    ctx.textAlign="left";
+    drawButton(UI.back);
+  }
+
+  function drawGameOver(){
+    ctx.save();
+    ctx.fillStyle = "rgba(0,0,0,0.62)";
+    roundRect(28, H*0.28, W-56, 260, 18); ctx.fill();
+
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = "900 28px system-ui";
+    ctx.fillText("GAME OVER", W/2, H*0.28 + 58);
+
+    ctx.font = "800 16px system-ui";
+    ctx.fillStyle = "rgba(229,231,235,0.95)";
+    ctx.fillText("KM: " + state.km.toFixed(2), W/2, H*0.28 + 108);
+    ctx.fillText("Best: " + state.bestKm.toFixed(2), W/2, H*0.28 + 138);
+
+    // buttons
+    drawButton(UI.restart);
+    drawButton(UI.back);
+
+    ctx.font = "600 12px system-ui";
+    ctx.fillStyle = "rgba(229,231,235,0.75)";
+    ctx.fillText("Press R to restart • ESC for menu", W/2, H*0.28 + 228);
+    ctx.restore();
+  }
+
+  // Start at menu
+  state.screen = "menu";
+})();
+</script>
+</body>
+</html>
