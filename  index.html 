@@ -1,664 +1,448 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Top-Down Car Racing</title>
-  <style>
-    html, body { height:100%; margin:0; background:#0b0f14; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
-    .wrap { height:100%; display:flex; align-items:center; justify-content:center; }
-    canvas { background:#111827; border-radius:14px; border:2px solid #263043; touch-action:none; }
-  </style>
-</head>
-<body>
-<div class="wrap">
-  <canvas id="c" width="420" height="820"></canvas>
-</div>
-
-<script>
-(() => {
-  const canvas = document.getElementById("c");
-  const ctx = canvas.getContext("2d");
-
-  const W = canvas.width, H = canvas.height;
-
-  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
-  const lerp = (a,b,t)=>a+(b-a)*t;
-  const rand = (a,b)=>a+Math.random()*(b-a);
-
-  // ---------- Game Config ----------
-  const MAX_SPEED = 260;          // km/h (your requirement)
-  const MIN_SPEED = 60;           // starting speed
-  const KM_TO_SPEED_RATE = 14;    // how fast speed increases per km
-  const LANES = 3;
-
-  // Road/track “changes quickly”
-  const track = {
-    // centerX will move left/right (curves)
-    centerX: W*0.5,
-    centerVel: 0,
-    targetX: W*0.5,
-    changeTimer: 0,
-    changeEveryMin: 0.9,
-    changeEveryMax: 1.8,
-
-    topWidth: 260,
-    bottomWidth: 330
-  };
-
-  function roadHalfWidthAt(y){
-    const t = y / H;
-    const w = lerp(track.topWidth, track.bottomWidth, t);
-    return w/2;
-  }
-  function roadLeftAt(y){ return track.centerX - roadHalfWidthAt(y); }
-  function roadRightAt(y){ return track.centerX + roadHalfWidthAt(y); }
-
-  function laneCenter(laneIndex, yRef){
-    const L = roadLeftAt(yRef), R = roadRightAt(yRef);
-    const laneW = (R-L)/LANES;
-    return L + laneW*(laneIndex+0.5);
-  }
-
-  // ---------- State ----------
-  const state = {
-    screen: "menu", // menu | highscores | playing | gameover
-    bestKm: Number(localStorage.getItem("bestKm") || 0),
-
-    km: 0,
-    speed: MIN_SPEED,
-
-    // Used to convert km/h to world pixels per second (visual feel)
-    worldPxPerSec: 260, // will be computed from speed each frame
-
-    // spawn logic
-    spawnT: 0,
-    spawnEvery: 0.75,
-
-    // scrolling visuals
-    scroll: 0
-  };
-
-  const player = {
-    x: W*0.5,
-    y: H*0.78,
-    w: 40,
-    h: 72,
-    steer: 0,
-    maxSteerPx: 320,
-  };
-
-  const traffic = []; // NPC cars + trucks
-  const particles = [];
-
-  // ---------- Input (steering only) ----------
-  const keys = new Set();
-  window.addEventListener("keydown", (e) => {
-    const k = e.key.toLowerCase();
-    keys.add(k);
-
-    if (k === "escape") state.screen = "menu";
-    if (k === "r" && (state.screen==="gameover")) startGame();
-  });
-  window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
-
-  let pointerX = null;
-  canvas.addEventListener("pointerdown", (e)=>{ pointerX = e.offsetX; });
-  canvas.addEventListener("pointermove", (e)=>{ if(e.buttons) pointerX = e.offsetX; });
-  window.addEventListener("pointerup", ()=>{ pointerX = null; });
-
-  // ---------- UI Buttons (canvas) ----------
-  function btn(x,y,w,h,label){
-    return {x,y,w,h,label};
-  }
-  const UI = {
-    start: btn(W*0.5-120, H*0.52, 240, 54, "START"),
-    high:  btn(W*0.5-120, H*0.52+70, 240, 54, "HIGH SCORE"),
-    back:  btn(16, 16, 110, 40, "BACK"),
-    restart: btn(W*0.5-120, H*0.62, 240, 54, "RESTART")
-  };
-
-  canvas.addEventListener("click", (e) => {
-    const mx = e.offsetX, my = e.offsetY;
-    const hit = (b)=> mx>=b.x && mx<=b.x+b.w && my>=b.y && my<=b.y+b.h;
-
-    if(state.screen==="menu"){
-      if(hit(UI.start)) startGame();
-      else if(hit(UI.high)) state.screen="highscores";
-    } else if(state.screen==="highscores"){
-      if(hit(UI.back)) state.screen="menu";
-    } else if(state.screen==="gameover"){
-      if(hit(UI.restart)) startGame();
-      else if(hit(UI.back)) state.screen="menu";
-    }
-  });
-
-  // ---------- Drawing Helpers ----------
-  function roundRect(x,y,w,h,r){
-    const rr = Math.min(r,w/2,h/2);
-    ctx.beginPath();
-    ctx.moveTo(x+rr,y);
-    ctx.arcTo(x+w,y,x+w,y+h,rr);
-    ctx.arcTo(x+w,y+h,x,y+h,rr);
-    ctx.arcTo(x,y+h,x,y,rr);
-    ctx.arcTo(x,y,x+w,y,rr);
-    ctx.closePath();
-  }
-
-  function drawButton(b){
-    ctx.save();
-    // shadow
-    ctx.fillStyle = "rgba(0,0,0,0.35)";
-    roundRect(b.x, b.y+3, b.w, b.h, 12); ctx.fill();
-
-    // body
-    ctx.fillStyle = "#111827";
-    ctx.strokeStyle = "#334155";
-    ctx.lineWidth = 2;
-    roundRect(b.x, b.y, b.w, b.h, 12); ctx.fill(); ctx.stroke();
-
-    ctx.fillStyle = "#e5e7eb";
-    ctx.font = "800 16px system-ui";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(b.label, b.x+b.w/2, b.y+b.h/2);
-    ctx.restore();
-  }
-
-  // ---------- Cars ----------
-  // Orange BMW-like (simple shape), NPC cars + trucks
-  function drawPlayerBMW(x,y,w,h){
-    ctx.save();
-    ctx.translate(x,y);
-
-    // glow (fast feeling)
-    ctx.globalAlpha = 0.25;
-    ctx.fillStyle = "#fb923c";
-    roundRect(-w*0.62, -h*0.55, w*1.24, h*1.12, 16);
-    ctx.fill();
-    ctx.globalAlpha = 1;
-
-    // body
-    ctx.fillStyle = "#f97316"; // orange
-    roundRect(-w/2, -h/2, w, h, 10); ctx.fill();
-
-    // hood/roof
-    ctx.fillStyle = "rgba(255,255,255,0.18)";
-    roundRect(-w*0.28, -h*0.34, w*0.56, h*0.22, 8); ctx.fill();
-
-    // BMW-ish stripes / grill hint
-    ctx.fillStyle = "rgba(17,24,39,0.55)";
-    roundRect(-w*0.18, -h*0.05, w*0.36, h*0.15, 6); ctx.fill();
-
-    // headlights
-    ctx.fillStyle = "rgba(255,255,255,0.9)";
-    ctx.fillRect(-w*0.36, -h*0.46, w*0.22, 6);
-    ctx.fillRect( w*0.14, -h*0.46, w*0.22, 6);
-
-    // wheels
-    ctx.fillStyle = "#0b0f14";
-    ctx.fillRect(-w/2-5, -h/2+12, 7, 16);
-    ctx.fillRect(-w/2-5,  h/2-28, 7, 16);
-    ctx.fillRect( w/2-2, -h/2+12, 7, 16);
-    ctx.fillRect( w/2-2,  h/2-28, 7, 16);
-
-    ctx.restore();
-  }
-
-  function drawNpcCar(o){
-    ctx.save();
-    ctx.translate(o.x,o.y);
-
-    if(o.type==="truck"){
-      // truck body
-      ctx.fillStyle = o.color;
-      roundRect(-o.w/2, -o.h/2, o.w, o.h, 8); ctx.fill();
-
-      ctx.fillStyle = "rgba(255,255,255,0.15)";
-      roundRect(-o.w*0.30, -o.h*0.36, o.w*0.60, o.h*0.20, 6); ctx.fill();
-
-      // container
-      ctx.fillStyle = "rgba(17,24,39,0.55)";
-      roundRect(-o.w*0.40, -o.h*0.05, o.w*0.80, o.h*0.45, 10); ctx.fill();
-    } else {
-      // car body
-      ctx.fillStyle = o.color;
-      roundRect(-o.w/2, -o.h/2, o.w, o.h, 10); ctx.fill();
-      ctx.fillStyle = "rgba(0,0,0,0.22)";
-      roundRect(-o.w*0.30, -o.h*0.34, o.w*0.60, o.h*0.24, 8); ctx.fill();
-
-      // stripe
-      ctx.fillStyle = "rgba(255,255,255,0.75)";
-      roundRect(-o.w*0.07, -o.h*0.45, o.w*0.14, o.h*0.9, 6); ctx.fill();
-    }
-
-    // wheels
-    ctx.fillStyle = "#0b0f14";
-    ctx.fillRect(-o.w/2-5, -o.h/2+12, 7, 16);
-    ctx.fillRect(-o.w/2-5,  o.h/2-28, 7, 16);
-    ctx.fillRect( o.w/2-2, -o.h/2+12, 7, 16);
-    ctx.fillRect( o.w/2-2,  o.h/2-28, 7, 16);
-
-    ctx.restore();
-  }
-
-  // ---------- Road + Grass (look similar to screenshot) ----------
-  function drawScene(dt){
-    // grass sides
-    ctx.fillStyle = "#2f7d2f";
-    ctx.fillRect(0,0,W,H);
-
-    // subtle grass noise
-    ctx.save();
-    ctx.globalAlpha = 0.12;
-    for(let i=0;i<120;i++){
-      ctx.fillStyle = (i%2===0) ? "#1f6a1f" : "#3c9a3c";
-      ctx.fillRect(Math.random()*W, Math.random()*H, rand(8,18), rand(8,20));
-    }
-    ctx.restore();
-
-    // road polygon
-    const L0 = roadLeftAt(0), R0 = roadRightAt(0);
-    const L1 = roadLeftAt(H), R1 = roadRightAt(H);
-
-    ctx.fillStyle = "#2b2b2b";
-    ctx.beginPath();
-    ctx.moveTo(L0,0); ctx.lineTo(R0,0); ctx.lineTo(R1,H); ctx.lineTo(L1,H);
-    ctx.closePath();
-    ctx.fill();
-
-    // road edge borders
-    ctx.strokeStyle = "rgba(255,255,255,0.55)";
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.moveTo(L0,0); ctx.lineTo(L1,H);
-    ctx.moveTo(R0,0); ctx.lineTo(R1,H);
-    ctx.stroke();
-
-    // center yellow line (like screenshot)
-    ctx.strokeStyle = "#fbbf24";
-    ctx.lineWidth = 4;
-    ctx.beginPath();
-    for(let y=0;y<=H;y+=18){
-      const x = track.centerX;
-      if(y===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
-    }
-    ctx.stroke();
-
-    // lane dashed white lines (2 lines for 3 lanes)
-    const dashSpeed = state.worldPxPerSec * 0.9;
-    state.scroll += dt * dashSpeed;
-    const dashOffset = -state.scroll;
-
-    for(let lane=1; lane<LANES; lane++){
-      ctx.save();
-      ctx.setLineDash([22, 26]);
-      ctx.lineDashOffset = dashOffset;
-      ctx.strokeStyle = "rgba(255,255,255,0.55)";
-      ctx.lineWidth = 3;
-
-      ctx.beginPath();
-      for(let y=0;y<=H;y+=16){
-        const left = roadLeftAt(y), right = roadRightAt(y);
-        const x = left + (right-left)*(lane/LANES);
-        if(y===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
-      }
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-
-  // ---------- HUD ----------
-  function drawHUD(){
-    // Left: KM, Right: SPEED
-    ctx.save();
-    ctx.textBaseline = "top";
-
-    // left panel
-    ctx.fillStyle = "rgba(0,0,0,0.45)";
-    roundRect(12, 12, 150, 56, 12); ctx.fill();
-    ctx.fillStyle = "#e5e7eb";
-    ctx.font = "800 14px system-ui";
-    ctx.fillText("KM", 24, 20);
-    ctx.font = "900 22px system-ui";
-    ctx.fillText(state.km.toFixed(2), 24, 36);
-
-    // right panel
-    ctx.fillStyle = "rgba(0,0,0,0.45)";
-    roundRect(W-12-170, 12, 170, 56, 12); ctx.fill();
-    ctx.fillStyle = "#e5e7eb";
-    ctx.font = "800 14px system-ui";
-    ctx.fillText("SPEED (km/h)", W-12-170+14, 20);
-
-    // speed number (color changes near max)
-    const nearMax = state.speed / MAX_SPEED;
-    ctx.font = "900 22px system-ui";
-    ctx.fillStyle = nearMax > 0.92 ? "#f97316" : "#e5e7eb";
-    ctx.fillText(String(Math.round(state.speed)), W-12-170+14, 36);
-
-    ctx.restore();
-  }
-
-  // ---------- Spawning traffic ----------
-  function spawnTraffic(){
-    const yRef = H * 0.35;
-
-    // choose lane & type
-    const lane = Math.floor(rand(0, LANES));
-    const x = laneCenter(lane, yRef);
-
-    const isTruck = Math.random() < clamp(0.18 + state.km*0.02, 0.18, 0.35);
-    const colors = ["#60a5fa","#ef4444","#22c55e","#a855f7","#f59e0b","#94a3b8"];
-
-    const o = {
-      type: isTruck ? "truck" : "car",
-      x,
-      y: -120,
-      w: isTruck ? 52 : 40,
-      h: isTruck ? 96 : 74,
-      color: colors[Math.floor(rand(0, colors.length))],
-      vy: state.worldPxPerSec * rand(0.85, 1.15)
-    };
-
-    // avoid instant overlap at spawn
-    for(const t of traffic){
-      if(Math.abs(t.x - o.x) < 50 && Math.abs(t.y - o.y) < 120) return;
-    }
-    traffic.push(o);
-  }
-
-  function overlap(a,b){
-    return (Math.abs(a.x-b.x)*2 < (a.w+b.w)) && (Math.abs(a.y-b.y)*2 < (a.h+b.h));
-  }
-
-  function explode(x,y){
-    for(let i=0;i<26;i++){
-      particles.push({
-        x,y,
-        vx: rand(-170,170),
-        vy: rand(-260,40),
-        life: rand(0.45,0.85),
-        r: rand(2,4)
-      });
-    }
-  }
-
-  // ---------- Track changes quickly ----------
-  function updateTrack(dt){
-    track.changeTimer -= dt;
-    if(track.changeTimer <= 0){
-      track.changeTimer = rand(track.changeEveryMin, track.changeEveryMax);
-
-      // new target center: keep road inside canvas
-      const margin = 56;
-      track.targetX = clamp(rand(W*0.5-90, W*0.5+90), margin, W-margin);
-    }
-
-    // quick-ish curve
-    const toTarget = (track.targetX - track.centerX);
-    track.centerVel += toTarget * dt * 2.8;
-    track.centerVel *= (1 - dt * 2.2);
-    track.centerX += track.centerVel * dt * 60;
-
-    // keep safe
-    track.centerX = clamp(track.centerX, 90, W-90);
-  }
-
-  // ---------- Game Flow ----------
-  function startGame(){
-    traffic.length = 0;
-    particles.length = 0;
-
-    state.km = 0;
-    state.speed = MIN_SPEED;
-    state.spawnT = 0;
-    state.spawnEvery = 0.75;
-    state.scroll = 0;
-
-    player.x = W*0.5;
-
-    track.centerX = W*0.5;
-    track.targetX = W*0.5;
-    track.centerVel = 0;
-    track.changeTimer = 0.1;
-
-    state.screen = "playing";
-  }
-
-  // ---------- Main Loop ----------
-  let last = performance.now();
-  requestAnimationFrame(function loop(now){
-    const dt = Math.min(0.033, (now-last)/1000);
-    last = now;
-
-    tick(dt);
-    draw(dt);
-
-    requestAnimationFrame(loop);
-  });
-
-  function tick(dt){
-    if(state.screen !== "playing") return;
-
-    // speed increases with kilometres (requirement)
-    // km grows by speed: km/h -> km per second = speed/3600
-    state.km += (state.speed / 3600) * dt;
-
-    // increase speed by km
-    const targetSpeed = clamp(MIN_SPEED + state.km * KM_TO_SPEED_RATE, MIN_SPEED, MAX_SPEED);
-    // make it “feel fast” near 260
-    const accel = (state.speed < 220) ? 18 : 28;
-    state.speed += (targetSpeed - state.speed) * clamp(accel * dt, 0, 1);
-
-    // convert speed to world pixels/sec (visual feel)
-    // tuned so 260 looks VERY fast
-    const speedT = state.speed / MAX_SPEED;
-    state.worldPxPerSec = lerp(260, 820, Math.pow(speedT, 1.35));
-
-    // track changes quickly
-    updateTrack(dt);
-
-    // spawn traffic more as speed increases
-    state.spawnEvery = clamp(0.85 - speedT*0.45, 0.34, 0.85);
-    state.spawnT += dt;
-    if(state.spawnT >= state.spawnEvery){
-      state.spawnT = 0;
-      spawnTraffic();
-      if(Math.random() < clamp(0.06 + speedT*0.18, 0.06, 0.25)) spawnTraffic();
-    }
-
-    // steering only
-    let steer = 0;
-    if(keys.has("arrowleft") || keys.has("a")) steer -= 1;
-    if(keys.has("arrowright") || keys.has("d")) steer += 1;
-
-    // mobile pointer steering
-    if(pointerX !== null){
-      const dx = pointerX - player.x;
-      steer = clamp(dx / 70, -1, 1);
-    }
-
-    // apply steering
-    const steerPx = player.maxSteerPx * (0.65 + speedT*0.55); // harder/faster feel at high speed
-    player.x += steer * steerPx * dt;
-
-    // keep inside road
-    const yRef = player.y + player.h*0.25;
-    const L = roadLeftAt(yRef) + player.w*0.55;
-    const R = roadRightAt(yRef) - player.w*0.55;
-    player.x = clamp(player.x, L, R);
-
-    // update traffic
-    for(let i=traffic.length-1;i>=0;i--){
-      const t = traffic[i];
-      t.y += (t.vy + state.worldPxPerSec*0.25) * dt;
-
-      // slight drift due to curves
-      t.x += (track.centerX - W*0.5) * dt * 0.15;
-
-      if(t.y > H + 140) traffic.splice(i,1);
-    }
-
-    // collisions
-    const pBox = {x:player.x,y:player.y,w:player.w,h:player.h};
-    for(const t of traffic){
-      const tBox = {x:t.x,y:t.y,w:t.w,h:t.h};
-      if(overlap(pBox,tBox)){
-        state.screen = "gameover";
-        explode(player.x, player.y);
-
-        // best score: KM
-        if(state.km > state.bestKm){
-          state.bestKm = state.km;
-          localStorage.setItem("bestKm", String(state.bestKm));
-        }
-        break;
-      }
-    }
-
-    // particles
-    for(let i=particles.length-1;i>=0;i--){
-      const p=particles[i];
-      p.life -= dt;
-      p.x += p.vx*dt;
-      p.y += p.vy*dt;
-      p.vy += 520*dt;
-      if(p.life<=0) particles.splice(i,1);
-    }
-  }
-
-  function draw(dt){
-    ctx.clearRect(0,0,W,H);
-
-    if(state.screen === "menu"){
-      drawMenu();
-      return;
-    }
-    if(state.screen === "highscores"){
-      drawHighScores();
-      return;
-    }
-
-    // playing/gameover background
-    drawScene(dt);
-
-    // traffic
-    for(const t of traffic) drawNpcCar(t);
-
-    // player
-    drawPlayerBMW(player.x, player.y, player.w, player.h);
-
-    // particles
-    ctx.save();
-    for(const p of particles){
-      ctx.globalAlpha = clamp(p.life,0,1);
-      ctx.fillStyle = "#f97316";
-      ctx.beginPath();
-      ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
-      ctx.fill();
-    }
-    ctx.restore();
-
-    // HUD
-    drawHUD();
-
-    if(state.screen === "gameover"){
-      drawGameOver();
-    }
-  }
-
-  function drawMenu(){
-    // background similar style
-    ctx.fillStyle = "#0b0f14";
-    ctx.fillRect(0,0,W,H);
-
-    // preview road
-    track.centerX = W*0.5;
-    drawScene(0);
-
-    // overlay
-    ctx.fillStyle = "rgba(0,0,0,0.55)";
-    roundRect(28, 90, W-56, 220, 18); ctx.fill();
-
-    ctx.fillStyle = "#e5e7eb";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.font = "900 28px system-ui";
-    ctx.fillText("CAR RACING", W/2, 140);
-
-    ctx.font = "600 14px system-ui";
-    ctx.fillStyle = "rgba(229,231,235,0.9)";
-    ctx.fillText("Steering only • Speed increases with kilometres • Max 260", W/2, 175);
-
-    // buttons
-    drawButton(UI.start);
-    drawButton(UI.high);
-
-    // best
-    ctx.fillStyle = "rgba(229,231,235,0.9)";
-    ctx.font = "800 14px system-ui";
-    ctx.fillText("Best KM: " + state.bestKm.toFixed(2), W/2, H*0.52+70+70);
-
-    // control hint
-    ctx.font = "600 12px system-ui";
-    ctx.fillStyle = "rgba(229,231,235,0.75)";
-    ctx.fillText("Controls: ← → or A D  |  Mobile: swipe", W/2, H-40);
-  }
-
-  function drawHighScores(){
-    ctx.fillStyle="#0b0f14";
-    ctx.fillRect(0,0,W,H);
-
-    ctx.fillStyle="rgba(0,0,0,0.55)";
-    roundRect(28, 90, W-56, 260, 18); ctx.fill();
-
-    ctx.fillStyle="#e5e7eb";
-    ctx.textAlign="center";
-    ctx.textBaseline="middle";
-    ctx.font="900 26px system-ui";
-    ctx.fillText("HIGH SCORE", W/2, 130);
-
-    ctx.font="800 18px system-ui";
-    ctx.fillStyle="rgba(229,231,235,0.95)";
-    ctx.fillText("Best Distance (KM)", W/2, 190);
-
-    ctx.font="900 34px system-ui";
-    ctx.fillStyle="#f97316";
-    ctx.fillText(state.bestKm.toFixed(2), W/2, 240);
-
-    ctx.textAlign="left";
-    drawButton(UI.back);
-  }
-
-  function drawGameOver(){
-    ctx.save();
-    ctx.fillStyle = "rgba(0,0,0,0.62)";
-    roundRect(28, H*0.28, W-56, 260, 18); ctx.fill();
-
-    ctx.fillStyle = "#fff";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.font = "900 28px system-ui";
-    ctx.fillText("GAME OVER", W/2, H*0.28 + 58);
-
-    ctx.font = "800 16px system-ui";
-    ctx.fillStyle = "rgba(229,231,235,0.95)";
-    ctx.fillText("KM: " + state.km.toFixed(2), W/2, H*0.28 + 108);
-    ctx.fillText("Best: " + state.bestKm.toFixed(2), W/2, H*0.28 + 138);
-
-    // buttons
-    drawButton(UI.restart);
-    drawButton(UI.back);
-
-    ctx.font = "600 12px system-ui";
-    ctx.fillStyle = "rgba(229,231,235,0.75)";
-    ctx.fillText("Press R to restart • ESC for menu", W/2, H*0.28 + 228);
-    ctx.restore();
-  }
-
-  // Start at menu
-  state.screen = "menu";
-})();
-</script>
-</body>
+<!DOCTYPE html>
+<html>
+	<head>
+		<title>Car Racer</title>
+		<meta charset="utf-8">
+		<script type="text/javascript" src="js/jquery-1.7.1.min.js"></script>
+		<script type="text/javascript">
+
+			$(document).ready(function() {
+
+				var then = Date.now();
+				function init() {			
+					setInterval(main, 20);
+				}
+
+				/*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-* 
+				 *	CANVAS
+				 */
+
+				function canvas() 
+				{
+					// *** Private vars
+					var canvas = document.getElementById("race-track");
+					var ctx = canvas.getContext("2d");
+
+					var canvasWidth = ctx.canvas.clientWidth;
+					var	canvasHeight = ctx.canvas.clientHeight;
+
+					// *** Add public pointer
+					this.getCtx = getCtx;
+					this.getCanvasWidth = getCanvasWidth;
+					this.getCanvasHeight = getCanvasHeight;
+
+					// *** Private -> public
+					function getCtx () {
+						return ctx;
+					}
+
+					// *** Private -> public
+					function getCanvasWidth () {
+						return canvasWidth;
+					}
+
+					// *** Private -> public
+					function getCanvasHeight () {
+						return canvasHeight;
+					}
+
+					// *** Public
+					this.clear = function() {
+						ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+					}
+				}			
+
+				/*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-* 
+				 *	MAIN
+				 */	
+
+				function main()
+				{
+					var now = Date.now();
+					var fps = 1000 / (now - then);
+
+					update();
+					render(fps);
+
+					then = now;
+				};
+
+				/*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-* 
+				 *	RENDER
+				 */	
+				 
+				function update(modifier) 
+				{
+					// *** Calculatge the cars new x,y pos	
+					car1.calcPos(modifier);
+
+					// *** Get the current tile the car is on
+					currentTileArray = car1.getTile(trackObj.tileWidth(), trackObj.tileHeight());
+				}
+
+				/*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-* 
+				 *	DRAW
+				 */	
+				 
+				function render(fps) 
+				{
+					// *** Clear canvas
+					canvas.clear();	
+
+					// *** Draw/render map
+					renderMap(trackObj);
+			
+					// *** Draw the car	
+					car1.drawCar(ctx);
+
+					// *** Draw the car	
+					hud(ctx, fps);
+				}
+
+				/*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-* 
+				 *	Draw Map
+				 */	
+
+				function renderMap(mapObj)
+				{
+					var rgt = mapObj.data();		
+
+					for (matrixY in rgt) {
+						for (matrixX in rgt[matrixY]) {
+
+							var matrixArray = rgt[matrixY][matrixX].split(',');
+
+							var x = matrixArray[1];
+							var y = matrixArray[0];
+							
+							var sx = (x-1) * mapObj.tileWidth();
+							var sy = (y-1) * mapObj.tileHeight();
+							
+							var dx = (matrixX) * mapObj.tileWidth();
+							var dy = (matrixY) * mapObj.tileHeight();
+
+							ctx.drawImage(mapObj.mapTilesImg(), sx, sy, mapObj.tileWidth(), mapObj.tileHeight(), dx, dy, mapObj.tileWidth(), mapObj.tileHeight());
+						}
+					}
+				}
+
+				/*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-* 
+				 *	Cars
+				 */	
+
+				function car(x, y, degrees, carObj) 
+				{
+
+					var MAX_TORQUE  = carObj.max_torque;		//(cause the car to spin out if value is reached (see IF statement below)) //1
+					var MAX_ACCEL   = carObj.max_speed; 		// px. per frame. squared (maximum speed) //1
+					var TURN_RADIUS = carObj.turn_radius; 	    // px (The smaller this number is, the sharper the turn the car will make.)
+					var DRAG		= carObj.drag; 			// ratio  (the larger the value, the faster the car loses speed)
+
+					var spinDrag    = 0.2;		
+
+					// *** Initialise
+					var xPos = x;
+					var yPos = y;
+					var _turn = 0;			// 1, 0, -1
+					var _accel = 0;			// 1, 0, -1
+					var _rotation = degrees;	
+
+					var xVel = 0; 			// px. per frame (point)
+					var yVel = 0;
+					var heading = degrees;	// radians
+					var spin = 0;			// radians per frame			
+					var spinImpact = 0;
+
+					// *** Car image
+					var carImage = new Image();   // Create new img element  
+					carImage.src = carObj.image; // Set source path  
+
+					var rightKey = false;
+					var leftKey = false;
+					var upKey = false;
+					var downKey = false;
+
+					this.drawCar = function(ctx) {
+
+						// *** Draw car (find center)
+					    var transX = xPos-(carImage.width/2);
+					    var transY = yPos-(carImage.height/2);
+					    
+					    ctx.save();
+					    ctx.translate(transX, transY);
+
+					    // *** Rotate car
+					    ctx.rotate(heading);
+					    ctx.translate(-xPos, -yPos);
+					      
+					    ctx.drawImage(carImage, transX, transY);  
+					    ctx.restore();  
+					}
+
+					this.calcPos = function() {
+
+						// *** Add drag. Slows car down when not accelerating (also reduces spin)
+						xVel *= (1 - DRAG);
+						yVel *= (1 - DRAG);
+
+						spinImpact *= spinDrag;
+						if ( Math.abs(spinImpact) <= 1 ) {
+							spinImpact = 0;
+						}
+
+						// *** Direction
+						heading = (_rotation * Math.PI / 180);
+
+						// *** Add acceleration
+						xVel += MAX_ACCEL * _accel * Math.sin(heading) //* modifier;
+						yVel -= MAX_ACCEL * _accel * Math.cos(heading) //* modifier;
+
+						var velMag = Math.sqrt(xVel * xVel + yVel * yVel);
+						spin  = velMag / TURN_RADIUS * _turn; // something like (_turn * 3) is good for simulating oil slip
+						
+						/* calculate torque (turning the car changes the direction it travels).
+						 * "First we calculate how much the velocity will change to get the car moving in the direction 
+						 * it is pointed. I'm calling this value torque"
+						 */
+						var torqueX = 0;
+						var torqueY = 0;
+						var newHeading = heading + spin + spinImpact;
+
+						torqueX = Math.sin(newHeading) * velMag - xVel;
+						torqueY = -Math.cos(newHeading) * velMag - yVel;
+						var torqueMag = Math.sqrt(Math.pow(torqueX,2) + Math.pow(torqueY,2));
+
+						// *** Limit torque, so the car will "spin out" if turning too fast
+						if (torqueMag > MAX_TORQUE) {
+							torqueX = MAX_TORQUE * torqueX / torqueMag;
+							torqueY = MAX_TORQUE * torqueY / torqueMag;
+						}
+
+						// *** Apply torque to velocity
+						xVel += torqueX;
+						yVel += torqueY;
+
+						// *** Set the new position and values
+						xPos += xVel;
+						yPos += yVel;
+						heading   = newHeading;
+						_rotation = heading * 180 / Math.PI;
+					}
+
+					// *** Setters and getters
+					this.forwardOn    = function (value) { _accel = 1; }
+					this.forwardOff   = function (value) { _accel = 0; }
+					this.reverseOn    = function (value) {	_accel = -1; }
+					this.reverseOff   = function (value) { _accel = 0; }
+					this.rightTurnOn  = function (value) { _turn = 1 }
+					this.rightTurnOff = function (value) { _turn = 0 }
+					this.leftTurnOn   = function (value) { _turn = -1; }
+					this.leftTurnOff  = function (value) { _turn = 0; }
+
+					this.setX         = function (x) { xPos = x; }
+					this.setY         = function (y) { yPos = y; }
+					this.setDirection = function (degreesx) { direction = degreesx; }
+					this.setSpeed     = function (speed) { speed = speed; }	
+
+					this.getX         = function () { return xPos; }
+					this.getY         = function () { return yPos; }
+					this.getDirection = function () { return direction; }
+					this.getSpeed     = function () { return speed; }
+					this.getTile      = function (tileWidth, tileHeight) {
+						var tileX = Math.ceil(xPos / tileWidth);
+						var tileY = Math.ceil(yPos / tileHeight);
+					}
+				}
+
+				/*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-* 
+				 *	Draw HUD
+				 */	
+
+				function hud(ctx, fps)
+				{
+					ctx.fillStyle = "rgb(250, 250, 250)";
+					ctx.font = "24px Helvetica";
+					ctx.textAlign = "left";
+					ctx.textBaseline = "top";
+					ctx.fillText("FPS: " + fps, 32, 32);
+				}
+
+				/*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-* 
+				 *	Keys
+				 */	
+
+				function onKeyDown(evt) 
+				{
+					switch (evt.keyCode) {
+						case 38:  // Up arrow 
+							car1.forwardOn();
+							break;
+						case 40:  // Down arrow
+							car1.reverseOn();
+							break;
+						case 37:  // Left arrow
+							car1.leftTurnOn();
+							break;
+						case 39:  // Right arrow
+							car1.rightTurnOn();
+							break;
+					}
+				}
+
+				function onKeyUp(evt) 
+				{
+					switch (evt.keyCode) {
+						case 38:  // Up arrow
+							car1.forwardOff();
+							break;
+						case 40:  // Down arrow
+							car1.reverseOff();
+							break;
+						case 37:  // Left arrow
+							car1.leftTurnOff();
+							break;
+						case 39:  // Right arrow
+							car1.rightTurnOff();
+							break;
+					}
+				}
+
+				/*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-* 
+				 *	MAPS
+				 */	
+
+				var track1 = {
+					tileset: "images/tileset-g-100.jpg",
+					tileWidth: 128,
+					tileHeight: 128,
+					startTile: '3,1',
+					startFacing: 'n',
+					rgt: [	['2,1', '1,2', '4,4', '1,2', '4,2', '2,2'],	
+							['4,3', '5,4', '7,1', '7,1', '13,4', '4,1'],
+							['3,4', '7,1', '7,3', '7,1', '2,1', '6,2'],
+							['1,1', '15,1', '7,1', '7,2', '4,1', '7,1'],
+							['6,1', '1,2', '4,2', '1,4', '6,2', '7,1']
+						],
+					trackMarkers: ['1,1', '1,6', '3,6', '4,5', '5,5', '5,1']
+				}
+				
+				function track(track) // CAN PROBABLY REMOVE THIS AND METHOD setStartPos CAN BE PART OF RENDER MAP.
+				{
+					var mapTilesImg = new Image();    
+					mapTilesImg.src = track.tileset;
+
+					this.mapTilesImg = function() {
+						return mapTilesImg;
+					}
+
+					this.tileset = function() {
+						return track.tileset;
+					}
+
+					this.tileWidth = function() {
+						return track.tileWidth;
+					}
+
+					this.tileHeight = function() {
+						return track.tileHeight;
+					}
+
+					this.data = function() {
+						return track.rgt;
+					}
+
+					this.trackMarkers = function() {
+						return track.trackMarkers;
+					}
+
+					this.setStartPos = function() 
+					{
+						var startTileArray = track.startTile.split(',');
+						var startTileX = startTileArray[1];
+						var startTileY = startTileArray[0];
+
+						var startX = (startTileX * track.tileWidth) - (track.tileWidth/2);				
+						var startY = (startTileY * track.tileHeight) - (track.tileHeight/2)
+
+						var rotation = 0;
+
+						switch (track.startFacing) {
+							case 'n':  
+								startY += 50; 
+								rotation = 0;
+								break;
+							case 's':   
+								startY -= (50 - 34); // 34 is the length of the car
+								rotation = 180;
+								break;
+							case 'w': 
+								startX += 50;
+								rotation = 270;
+								break;
+							case 'e':  
+								startX -= (50 - 20);
+								rotation = 90;
+								break;
+						}
+
+						// *** Stored as x,y
+						return posArray = [startX, startY, rotation];
+					}
+				}
+
+				/*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-* 
+				 *	CARS
+				 */	
+
+				var car1 = {
+					image: "images/carred.png",
+					max_speed: 0.5,
+					max_torque: 0.4,
+					turn_radius: 100,
+					drag: 0.05
+				}
+
+				var car2 = {
+					image: "images/carred.png",
+					max_speed: 0.4,
+					max_torque: 0.5,
+					turn_radius: 90,
+					drag: 0.05
+				}
+
+				/*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-* 
+				 *	RUN
+				 */	
+				 
+				// *** Create the canvas object
+				var canvas = new canvas();
+
+				// *** Get the canvas
+				var ctx = canvas.getCtx();
+
+				// *** Clear canvas
+				canvas.clear();	
+		
+				// *** Create map object
+				var trackObj = new track(track1);	
+				x = trackObj.setStartPos()[0];
+				y = trackObj.setStartPos()[1];
+				direction = trackObj.setStartPos()[2];
+				
+				// *** Create car object
+				car1 = new car(x, y, direction, car1);
+
+				// *** Run
+				init();
+
+				// *** Bind keys
+				$(document).keydown(onKeyDown);
+				$(document).keyup(onKeyUp);
+
+			});
+		</script>
+	</head>
+	<body>
+		<canvas id="race-track"  width="768" height="640" style="border:1px solid black;"></canvas>
+	</body>
 </html>
