@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="ml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Top-Down Car Racing</title>
+  <style>
+    html, body { height:100%; margin:0; background:#0b0f14; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    .wrap { height:100%; display:flex; align-items:center; justify-content:center; }
+    canvas { background:#111827; border-radius:14px; border:2px solid #263043; touch-action:none; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="c" width="420" height="820"></canvas>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const lerp = (a,b,t)=>a+(b-a)*t;
+  const rand = (a,b)=>a+Math.random()*(b-a);
+
+  // ---------- Config ----------
+  const MAX_SPEED = 260;          // km/h
+  const MIN_SPEED = 60;           // km/h start
+  const KM_TO_SPEED_RATE = 14;    // speed increases per km
+  const LANES = 3;
+
+  // ---------- Sprite sheet ----------
+  // Save your image as: cars.jpg (same folder as index.html)
+  const SPRITE_URL = "cars.jpg";
+  const spriteImg = new Image();
+  spriteImg.src = SPRITE_URL;
+  let spriteReady = false;
+  spriteImg.onload = () => { spriteReady = true; };
+
+  // Layout (your image: 2 rows, top has 8 cars, bottom has 7 cars)
+  // We must ignore the top title and bottom text areas.
+  const SPR = {
+    colsTop: 8,
+    colsBottom: 7,
+    rows: 2,
+    padTopText: 70,
+    padBottomText: 110,
+    padSide: 0
+  };
+
+  function getCarRect(row, col){
+    const usableX = SPR.padSide;
+    const usableY = SPR.padTopText;
+    const usableW = spriteImg.width - SPR.padSide*2;
+    const usableH = spriteImg.height - SPR.padTopText - SPR.padBottomText;
+
+    const rowH = usableH / SPR.rows;
+
+    if(row === 0){
+      const cellW = usableW / SPR.colsTop;
+      return { sx: usableX + col*cellW, sy: usableY + 0*rowH, sw: cellW, sh: rowH };
+    } else {
+      const cellW = usableW / SPR.colsBottom;
+      return { sx: usableX + col*cellW, sy: usableY + 1*rowH, sw: cellW, sh: rowH };
+    }
+  }
+
+  // Player: orange car = top row last (index 7)
+  const PLAYER_SPR = { row: 0, col: 7 };
+
+  // NPC pool: all other cars
+  const NPC_SPRS = [
+    ...Array.from({length: 7}, (_,i)=>({row:0,col:i})),  // top row 0..6
+    ...Array.from({length: 7}, (_,i)=>({row:1,col:i}))   // bottom row 0..6
+  ];
+
+  // ---------- Track (curves change quickly) ----------
+  const track = {
+    centerX: W*0.5,
+    centerVel: 0,
+    targetX: W*0.5,
+    changeTimer: 0,
+    changeEveryMin: 0.9,
+    changeEveryMax: 1.8,
+    topWidth: 260,
+    bottomWidth: 330
+  };
+
+  function roadHalfWidthAt(y){
+    const t = y / H;
+    const w = lerp(track.topWidth, track.bottomWidth, t);
+    return w/2;
+  }
+  function roadLeftAt(y){ return track.centerX - roadHalfWidthAt(y); }
+  function roadRightAt(y){ return track.centerX + roadHalfWidthAt(y); }
+
+  function laneCenter(laneIndex, yRef){
+    const L = roadLeftAt(yRef), R = roadRightAt(yRef);
+    const laneW = (R-L)/LANES;
+    return L + laneW*(laneIndex+0.5);
+  }
+
+  // ---------- State ----------
+  const state = {
+    screen: "menu", // menu | highscores | playing | gameover
+    bestKm: Number(localStorage.getItem("bestKm") || 0),
+
+    km: 0,
+    speed: MIN_SPEED,
+    worldPxPerSec: 260,
+
+    spawnT: 0,
+    spawnEvery: 0.75,
+
+    scroll: 0
+  };
+
+  const player = {
+    x: W*0.5,
+    y: H*0.78,
+    w: 44,
+    h: 78,
+    maxSteerPx: 320
+  };
+
+  const traffic = [];
+  const particles = [];
+
+  // ---------- Input (steering only) ----------
+  const keys = new Set();
+  window.addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    keys.add(k);
+
+    if (k === "escape") state.screen = "menu";
+    if (k === "r" && state.screen==="gameover") startGame();
+  });
+  window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
+
+  let pointerX = null;
+  canvas.addEventListener("pointerdown", (e)=>{ pointerX = e.offsetX; });
+  canvas.addEventListener("pointermove", (e)=>{ if(e.buttons) pointerX = e.offsetX; });
+  window.addEventListener("pointerup", ()=>{ pointerX = null; });
+
+  // ---------- UI Buttons (canvas) ----------
+  function btn(x,y,w,h,label){ return {x,y,w,h,label}; }
+  const UI = {
+    start:   btn(W*0.5-120, H*0.52,     240, 54, "START"),
+    high:    btn(W*0.5-120, H*0.52+70,  240, 54, "HIGH SCORE"),
+    back:    btn(16, 16, 110, 40, "BACK"),
+    restart: btn(W*0.5-120, H*0.62,     240, 54, "RESTART")
+  };
+
+  canvas.addEventListener("click", (e) => {
+    const mx = e.offsetX, my = e.offsetY;
+    const hit = (b)=> mx>=b.x && mx<=b.x+b.w && my>=b.y && my<=b.y+b.h;
+
+    if(state.screen==="menu"){
+      if(hit(UI.start)) startGame();
+      else if(hit(UI.high)) state.screen="highscores";
+    } else if(state.screen==="highscores"){
+      if(hit(UI.back)) state.screen="menu";
+    } else if(state.screen==="gameover"){
+      if(hit(UI.restart)) startGame();
+      else if(hit(UI.back)) state.screen="menu";
+    }
+  });
+
+  // ---------- Drawing Helpers ----------
+  function roundRect(x,y,w,h,r){
+    const rr = Math.min(r,w/2,h/2);
+    ctx.beginPath();
+    ctx.moveTo(x+rr,y);
+    ctx.arcTo(x+w,y,x+w,y+h,rr);
+    ctx.arcTo(x+w,y+h,x,y+h,rr);
+    ctx.arcTo(x,y+h,x,y,rr);
+    ctx.arcTo(x,y,x+w,y,rr);
+    ctx.closePath();
+  }
+
+  function drawButton(b){
+    ctx.save();
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    roundRect(b.x, b.y+3, b.w, b.h, 12); ctx.fill();
+
+    ctx.fillStyle = "#111827";
+    ctx.strokeStyle = "#334155";
+    ctx.lineWidth = 2;
+    roundRect(b.x, b.y, b.w, b.h, 12); ctx.fill(); ctx.stroke();
+
+    ctx.fillStyle = "#e5e7eb";
+    ctx.font = "800 16px system-ui";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(b.label, b.x+b.w/2, b.y+b.h/2);
+    ctx.restore();
+  }
+
+  // ---------- Sprite draw ----------
+  function drawSpriteCar(x, y, w, h, spr){
+    if(!spriteReady){
+      ctx.fillStyle = "#f97316";
+      roundRect(x-w/2, y-h/2, w, h, 10); ctx.fill();
+      return;
+    }
+
+    const r = getCarRect(spr.row, spr.col);
+
+    // Crop inside each cell to remove margins/background
+    const insetX = r.sw * 0.12;
+    const insetY = r.sh * 0.18;
+
+    const sx = r.sx + insetX;
+    const sy = r.sy + insetY;
+    const sw = r.sw - insetX*2;
+    const sh = r.sh - insetY*2;
+
+    ctx.drawImage(spriteImg, sx, sy, sw, sh, x - w/2, y - h/2, w, h);
+  }
+
+  function drawPlayerCar(){
+    drawSpriteCar(player.x, player.y, player.w, player.h, PLAYER_SPR);
+
+    // extra speed glow when near max
+    const t = state.speed / MAX_SPEED;
+    if(t > 0.9){
+      ctx.save();
+      ctx.globalAlpha = (t - 0.9) / 0.1 * 0.25;
+      ctx.fillStyle = "#fb923c";
+      roundRect(player.x-player.w*0.75, player.y-player.h*0.65, player.w*1.5, player.h*1.35, 18);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawNpcCar(o){
+    drawSpriteCar(o.x, o.y, o.w, o.h, o.spr);
+  }
+
+  // ---------- Road + grass ----------
+  function drawScene(dt){
+    // grass
+    ctx.fillStyle = "#2f7d2f";
+    ctx.fillRect(0,0,W,H);
+
+    // grass noise
+    ctx.save();
+    ctx.globalAlpha = 0.12;
+    for(let i=0;i<90;i++){
+      ctx.fillStyle = (i%2===0) ? "#1f6a1f" : "#3c9a3c";
+      ctx.fillRect(Math.random()*W, Math.random()*H, rand(8,18), rand(8,20));
+    }
+    ctx.restore();
+
+    // road polygon
+    const L0 = roadLeftAt(0), R0 = roadRightAt(0);
+    const L1 = roadLeftAt(H), R1 = roadRightAt(H);
+
+    ctx.fillStyle = "#2b2b2b";
+    ctx.beginPath();
+    ctx.moveTo(L0,0); ctx.lineTo(R0,0); ctx.lineTo(R1,H); ctx.lineTo(L1,H);
+    ctx.closePath();
+    ctx.fill();
+
+    // road edges
+    ctx.strokeStyle = "rgba(255,255,255,0.55)";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(L0,0); ctx.lineTo(L1,H);
+    ctx.moveTo(R0,0); ctx.lineTo(R1,H);
+    ctx.stroke();
+
+    // center yellow line
+    ctx.strokeStyle = "#fbbf24";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    for(let y=0;y<=H;y+=18){
+      const x = track.centerX;
+      if(y===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+
+    // lane dashed lines
+    const dashSpeed = state.worldPxPerSec * 0.9;
+    state.scroll += dt * dashSpeed;
+    const dashOffset = -state.scroll;
+
+    for(let lane=1; lane<LANES; lane++){
+      ctx.save();
+      ctx.setLineDash([22, 26]);
+      ctx.lineDashOffset = dashOffset;
+      ctx.strokeStyle = "rgba(255,255,255,0.55)";
+      ctx.lineWidth = 3;
+
+      ctx.beginPath();
+      for(let y=0;y<=H;y+=16){
+        const left = roadLeftAt(y), right = roadRightAt(y);
+        const x = left + (right-left)*(lane/LANES);
+        if(y===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // ---------- HUD ----------
+  function drawHUD(){
+    ctx.save();
+    ctx.textBaseline = "top";
+
+    // Left: KM
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    roundRect(12, 12, 150, 56, 12); ctx.fill();
+    ctx.fillStyle = "#e5e7eb";
+    ctx.font = "800 14px system-ui";
+    ctx.fillText("KM", 24, 20);
+    ctx.font = "900 22px system-ui";
+    ctx.fillText(state.km.toFixed(2), 24, 36);
+
+    // Right: SPEED
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    roundRect(W-12-170, 12, 170, 56, 12); ctx.fill();
+    ctx.fillStyle = "#e5e7eb";
+    ctx.font = "800 14px system-ui";
+    ctx.fillText("SPEED (km/h)", W-12-170+14, 20);
+
+    const nearMax = state.speed / MAX_SPEED;
+    ctx.font = "900 22px system-ui";
+    ctx.fillStyle
